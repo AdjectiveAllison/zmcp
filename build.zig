@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
         .name = "zmcp",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
-        .root_source_file = .{ .cwd_relative = "src/zmcp.zig" },
+        .root_source_file = b.path("src/zmcp.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -32,13 +32,13 @@ pub fn build(b: *std.Build) void {
 
     // Create the module that examples can import
     const zmcp_module = b.addModule("zmcp", .{
-        .root_source_file = .{ .cwd_relative = "src/zmcp.zig" },
+        .root_source_file = b.path("src/zmcp.zig"),
     });
 
     // Build the echo example
     const echo_example = b.addExecutable(.{
         .name = "echo-example",
-        .root_source_file = .{ .cwd_relative = "examples/echo.zig" },
+        .root_source_file = b.path("examples/echo.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests
     const lib_unit_tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/zmcp.zig" },
+        .root_source_file = b.path("src/zmcp.zig"),
         .target = target,
         .optimize = optimize,
     });

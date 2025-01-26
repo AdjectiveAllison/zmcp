@@ -4,11 +4,9 @@ A lightweight Zig implementation of the [Model Context Protocol](https://spec.mo
 
 ## Features
 
-- **Zero-cost Abstractions**: Compile-time validation of tool interfaces with no runtime overhead
-- **Smart Type Conversion**: Automatic translation between Zig types and JSON 
-  - Supports basic types (strings, integers, floats, booleans)
-  - Handles optionals and arrays
-  - Generates JSON schemas at compile time
+- **Type-Safe Tools**: Struct-based parameters with compile-time validation
+- **Automatic Resource Management**: Allocator injection for heap-using tools
+- **Error Conversion**: Zig errors automatically converted to MCP error responses
 - **Transport Layer**: Current support for stdio transport (HTTP+SSE planned)
 - **MCP Features**:
   - ✅ Tools API with full schema generation
@@ -17,36 +15,6 @@ A lightweight Zig implementation of the [Model Context Protocol](https://spec.mo
   - ⏳ Resources API (planned)
   - ⏳ Prompts API (planned)
 
-## Quick Start
-
-```zig
-const std = @import("std");
-const zmcp = @import("zmcp");
-
-// Define a simple tool function
-fn echoFn(message: []const u8) ![]const u8 {
-    return message;
-}
-
-// Create an MCP tool with compile-time validation
-const echo_tool = zmcp.Tool(
-    "echo",
-    "Echo back a message",
-    echoFn,
-);
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var server = try zmcp.Server.init(allocator, "Example Server", "1.0.0");
-    defer server.deinit();
-
-    try server.addTool(echo_tool);
-    try server.start();
-}
-```
 
 ## Installation
 
@@ -70,33 +38,42 @@ const zmcp = zmcp_dep.module("zmcp");
 exe.root_module.addImport("zmcp", zmcp);
 ```
 
-## Type System
-
-ZMCP automatically handles conversion between Zig types and JSON values:
+## Quick Start
 
 ```zig
-// Supported types for tool parameters and returns:
-const BasicTypes = union(enum) {
-    string: []const u8,      // JSON string
-    integer: i64,           // JSON number (integer)
-    float: f64,            // JSON number (float)
-    boolean: bool,         // JSON boolean
-    optional: ?[]const u8,  // JSON null | type
-    array: []const u8,     // JSON array
+const EchoParams = struct {
+    allocator: std.mem.Allocator, // Auto-injected by server
+    message: []const u8,
+    repeat: u32 = 1 // Default value
 };
 
-// Structs are automatically converted to JSON objects
-const Config = struct {
-    name: []const u8,
-    count: i64,
-    enabled: ?bool,
-};
-
-fn configTool(config: Config) !void {
-    // Fields are automatically validated and converted
+fn echoFn(params: EchoParams) ![]const u8 {
+    // ... implementation using params.allocator
 }
 
-const tool = zmcp.Tool("config", "Update config", configTool);
+const echo_tool = zmcp.Tool(
+    "echo",
+    "Echo with repetition",
+    echoFn // Struct-based handler
+);
+```
+
+## Structured Parameters
+
+Tools must use a struct parameter containing:
+- An optional `allocator` field (auto-injected)
+- Typed parameters with validation
+- Optional fields with default values
+- struct keys turn into names for the tool call parameters
+
+Example parameter struct:
+```zig
+const ProcessArgs = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    iterations: u32 = 10,
+    verbose: ?bool = null
+};
 ```
 
 ## Current Limitations

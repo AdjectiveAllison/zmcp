@@ -5,7 +5,7 @@ const types = @import("types.zig");
 pub const ToolInstance = struct {
     name: []const u8,
     description: []const u8,
-    call: *const fn (protocol.Value) protocol.Value,
+    call: *const fn (protocol.Value, std.mem.Allocator) protocol.Value,
     input_schema: *const fn (std.mem.Allocator) protocol.Value,
 
     pub fn toJson(self: ToolInstance, allocator: std.mem.Allocator) protocol.Value {
@@ -115,48 +115,38 @@ fn wrapFunction(comptime name: []const u8, comptime description: []const u8, com
 
     // Create the wrapper function that converts between JSON and native types
     const wrapper = struct {
-        fn call(json_arg: protocol.Value) protocol.Value {
-            // Use page_allocator for strings that need to persist beyond this call
-            const persistent_allocator = std.heap.page_allocator;
-
-            // Use arena for temporary allocations during the call
-            var arena = std.heap.ArenaAllocator.init(persistent_allocator);
-            const temp_allocator = arena.allocator();
+        fn call(json_arg: protocol.Value, result_allocator: std.mem.Allocator) protocol.Value {
+            // Use an arena for temporary allocations during conversion
+            var arena = std.heap.ArenaAllocator.init(result_allocator);
+            defer arena.deinit();
 
             if (json_arg != .object) {
-                arena.deinit();
-                return .{ .string = "Arguments must be an object" };
+                var msg = std.ArrayList(u8).init(result_allocator);
+                msg.writer().writeAll("Arguments must be an object") catch unreachable;
+                return .{ .string = msg.toOwnedSlice() catch unreachable };
             }
 
             // Convert JSON directly to parameter struct
             var params = convertFromJson(ParamType, json_arg) catch |err| {
-                var msg = std.ArrayList(u8).init(temp_allocator);
+                var msg = std.ArrayList(u8).init(result_allocator);
                 std.fmt.format(msg.writer(), "Invalid parameters: {s}", .{@errorName(err)}) catch unreachable;
-                const str = persistent_allocator.dupe(u8, msg.items) catch unreachable;
-                const result = .{ .string = str };
-                arena.deinit();
-                return result;
+                return .{ .string = msg.toOwnedSlice() catch unreachable };
             };
 
             // Add allocator to params if struct has allocator field
             if (@hasField(ParamType, "allocator")) {
-                params.allocator = temp_allocator;
+                params.allocator = result_allocator;
             }
 
             // Call the function with the struct parameter
             const native_result = func(params) catch |err| {
-                var msg = std.ArrayList(u8).init(temp_allocator);
+                var msg = std.ArrayList(u8).init(result_allocator);
                 std.fmt.format(msg.writer(), "Function call failed: {s}", .{@errorName(err)}) catch unreachable;
-                const str = persistent_allocator.dupe(u8, msg.items) catch unreachable;
-                const result = .{ .string = str };
-                arena.deinit();
-                return result;
+                return .{ .string = msg.toOwnedSlice() catch unreachable };
             };
 
-            // Convert result back to JSON using the persistent allocator
-            const result = convertToJson(ReturnPayload, native_result, persistent_allocator);
-            arena.deinit();
-            return result;
+            // Convert result back to JSON using the result allocator
+            return convertToJson(ReturnPayload, native_result, result_allocator);
         }
 
         fn getInputSchema(allocator: std.mem.Allocator) protocol.Value {

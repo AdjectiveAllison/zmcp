@@ -106,7 +106,7 @@ pub const Server = struct {
         }
 
         // Execute the tool
-        const result = tool.call(args);
+        const result = tool.call(args, self.allocator);
 
         if (progress_token != null) {
             // Send completion progress notification

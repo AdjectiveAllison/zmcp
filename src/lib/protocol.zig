@@ -251,6 +251,50 @@ pub fn parseResponse(allocator: std.mem.Allocator, json: Value) !Response {
     };
 }
 
+/// Parse a JSON message into a JSON-RPC response using an arena allocator
+pub fn parseResponseArena(arena: std.mem.Allocator, json: Value) !Response {
+    if (json != .object) return error.InvalidResponse;
+
+    const jsonrpc = json.object.get("jsonrpc") orelse return error.InvalidResponse;
+    if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) return error.InvalidResponse;
+
+    const id = json.object.get("id") orelse return error.InvalidResponse;
+
+    // Check for error
+    if (json.object.get("error")) |err| {
+        if (err != .object) return error.InvalidResponse;
+
+        const code = err.object.get("code") orelse return error.InvalidResponse;
+        if (code != .integer) return error.InvalidResponse;
+
+        const message = err.object.get("message") orelse return error.InvalidResponse;
+        if (message != .string) return error.InvalidResponse;
+
+        const data = err.object.get("data");
+
+        return Response{
+            .jsonrpc = "2.0",
+            .id = try cloneValue(arena, id),
+            .result = null,
+            .@"error" = .{
+                .code = code.integer,
+                .message = try arena.dupe(u8, message.string),
+                .data = if (data) |d| try cloneValue(arena, d) else null,
+            },
+        };
+    }
+
+    // Check for result
+    const result = json.object.get("result");
+
+    return Response{
+        .jsonrpc = "2.0",
+        .id = try cloneValue(arena, id),
+        .result = if (result) |r| try cloneValue(arena, r) else null,
+        .@"error" = null,
+    };
+}
+
 /// Free resources used by a Response
 pub fn deinitResponse(allocator: std.mem.Allocator, response: *Response) void {
     if (response.id) |*id| {

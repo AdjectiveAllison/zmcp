@@ -115,20 +115,17 @@ const RequestState = struct {
     user_context: ?*anyopaque = null,
 
     pub fn deinit(self: *RequestState) void {
+        // Clean up response if present
         if (self.response) |*resp| {
-            if (resp.result) |*result| {
-                protocol.cleanupValue(self.allocator, result);
-            }
-            if (resp.@"error") |*err| {
-                if (err.data) |*data| {
-                    protocol.cleanupValue(self.allocator, data);
-                }
-                self.allocator.free(err.message);
-            }
+            protocol.deinitResponse(self.allocator, resp);
         }
+        
+        // Clean up ID
         if (self.id == .string) {
             self.allocator.free(self.id.string);
         }
+        
+        // Clean up progress token
         if (self.progress_token) |*token| {
             protocol.cleanupValue(self.allocator, token);
         }
@@ -443,43 +440,42 @@ pub const Client = struct {
     pub fn initialize(self: *Client, options: InitializeOptions) !void {
         std.debug.print("Client initializing...\n", .{});
 
-        // Create capabilities object
-        var capabilities = std.json.ObjectMap.init(self.allocator);
-        defer capabilities.deinit();
+        // Create an arena for temporary allocations
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Create capabilities object using arena
+        var capabilities = std.json.ObjectMap.init(arena);
 
         if (options.enable_sampling) {
-            const sampling_obj = std.json.ObjectMap.init(self.allocator);
+            const sampling_obj = std.json.ObjectMap.init(arena);
             try capabilities.put("sampling", .{ .object = sampling_obj });
         }
 
         if (options.enable_roots) {
-            const roots_obj = std.json.ObjectMap.init(self.allocator);
+            const roots_obj = std.json.ObjectMap.init(arena);
             try capabilities.put("roots", .{ .object = roots_obj });
         }
 
-        // Create client info object
-        var client_info = std.json.ObjectMap.init(self.allocator);
-        defer client_info.deinit();
+        // Create client info object using arena
+        var client_info = std.json.ObjectMap.init(arena);
 
-        const name_copy = try self.allocator.dupe(u8, options.name);
-        errdefer self.allocator.free(name_copy);
+        const name_copy = try arena.dupe(u8, options.name);
         try client_info.put("name", .{ .string = name_copy });
 
-        const version_copy = try self.allocator.dupe(u8, options.version);
-        errdefer self.allocator.free(version_copy);
+        const version_copy = try arena.dupe(u8, options.version);
         try client_info.put("version", .{ .string = version_copy });
 
-        // Create params
-        var params = std.json.ObjectMap.init(self.allocator);
-        defer params.deinit();
+        // Create params using arena
+        var params = std.json.ObjectMap.init(arena);
 
-        const protocol_copy = try self.allocator.dupe(u8, self.protocol_version);
-        errdefer self.allocator.free(protocol_copy);
+        const protocol_copy = try arena.dupe(u8, self.protocol_version);
         try params.put("protocolVersion", .{ .string = protocol_copy });
 
-        // Make clones of the objects to transfer ownership to params
-        try params.put("capabilities", try protocol.cloneValue(self.allocator, .{ .object = capabilities }));
-        try params.put("clientInfo", try protocol.cloneValue(self.allocator, .{ .object = client_info }));
+        // Add objects to params (no need to clone since they're all in the arena)
+        try params.put("capabilities", .{ .object = capabilities });
+        try params.put("clientInfo", .{ .object = client_info });
 
         // Send initialize request
         const id = self.nextId();
@@ -712,37 +708,23 @@ pub const Client = struct {
         }
         std.debug.print("Sending tool call to: {s}\n", .{name});
 
-        // Create params with proper cleanup
-        var params = std.json.ObjectMap.init(self.allocator);
-        errdefer {
-            var it = params.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* == .string) {
-                    self.allocator.free(entry.value_ptr.*.string);
-                }
-                if (entry.value_ptr.* == .object) {
-                    protocol.cleanupValue(self.allocator, entry.value_ptr);
-                }
-            }
-            params.deinit();
-        }
+        // Create an arena for temporary allocations
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
+        // Create params using arena
+        var params = std.json.ObjectMap.init(arena);
+
+        // Copy name to arena
+        const name_copy = try arena.dupe(u8, name);
         try params.put("name", .{ .string = name_copy });
 
         // Handle arguments based on type
         const Args = @TypeOf(args);
         if (@typeInfo(Args) == .Struct) {
-            // Create an object for the arguments
-            var args_obj = std.json.ObjectMap.init(self.allocator);
-            errdefer {
-                var it = args_obj.iterator();
-                while (it.next()) |entry| {
-                    protocol.cleanupValue(self.allocator, entry.value_ptr);
-                }
-                args_obj.deinit();
-            }
+            // Create an object for the arguments using arena
+            var args_obj = std.json.ObjectMap.init(arena);
 
             inline for (std.meta.fields(Args)) |field| {
                 const field_value = @field(args, field.name);
@@ -750,8 +732,7 @@ pub const Client = struct {
                 // Handle each field based on its type
                 switch (@TypeOf(field_value)) {
                     []const u8 => {
-                        const str_copy = try self.allocator.dupe(u8, field_value);
-                        errdefer self.allocator.free(str_copy);
+                        const str_copy = try arena.dupe(u8, field_value);
                         try args_obj.put(field.name, .{ .string = str_copy });
                     },
                     comptime_int, i8, i16, i32, i64, isize => try args_obj.put(field.name, .{ .integer = field_value }),
@@ -760,8 +741,7 @@ pub const Client = struct {
                     bool => try args_obj.put(field.name, .{ .bool = field_value }),
                     else => {
                         // For non-primitive types, just use a string representation
-                        const str_repr = try std.fmt.allocPrint(self.allocator, "{any}", .{field_value});
-                        errdefer self.allocator.free(str_repr);
+                        const str_repr = try std.fmt.allocPrint(arena, "{any}", .{field_value});
                         try args_obj.put(field.name, .{ .string = str_repr });
                     },
                 }
@@ -770,23 +750,23 @@ pub const Client = struct {
             try params.put("arguments", .{ .object = args_obj });
         } else {
             // If not a struct, convert directly to a string
-            const str_repr = try std.fmt.allocPrint(self.allocator, "{any}", .{args});
-            errdefer self.allocator.free(str_repr);
+            const str_repr = try std.fmt.allocPrint(arena, "{any}", .{args});
             try params.put("arguments", .{ .string = str_repr });
         }
 
-        // Add progress token if provided
+        // Add progress token if provided - these need to be persistent
         var progress_token_copy: ?protocol.Value = null;
         if (options.progress_token) |token| {
+            // Clone to permanent storage for the request state
             progress_token_copy = try protocol.cloneValue(self.allocator, token);
-            errdefer if (progress_token_copy) |*ptoken| protocol.cleanupValue(self.allocator, ptoken);
-            try params.put("progressToken", try protocol.cloneValue(self.allocator, token));
+            // Use arena for the request itself
+            try params.put("progressToken", try protocol.cloneValue(arena, token));
         }
 
         // Create a unique ID for this request
         const id = self.nextId();
         
-        // Create request state with progress handling info
+        // Create request state with progress handling info - this is persistent storage
         const req_state = RequestState{
             .id = id,
             .allocator = self.allocator,
@@ -803,19 +783,34 @@ pub const Client = struct {
         try self.sendRequest("tools/call", params_value, id);
 
         // Wait for response with proper timeout handling
-        const response = try self.waitForResponse(id, options.timeout_ms);
+        var response = try self.waitForResponse(id, options.timeout_ms);
 
         if (response.@"error" != null) {
+            protocol.deinitResponse(self.allocator, &response);
             return error.ToolCallFailed;
         }
 
-        const result = response.result orelse return error.ToolCallFailed;
-        if (result != .object) return error.ToolCallFailed;
+        const result = response.result orelse {
+            protocol.deinitResponse(self.allocator, &response);
+            return error.ToolCallFailed;
+        };
+        
+        if (result != .object) {
+            protocol.deinitResponse(self.allocator, &response);
+            return error.ToolCallFailed;
+        }
 
         const is_error = if (result.object.get("isError")) |err| (err == .bool and err.bool) else false;
 
-        const content = result.object.get("content") orelse return error.ToolCallFailed;
-        if (content != .array) return error.ToolCallFailed;
+        const content = result.object.get("content") orelse {
+            protocol.deinitResponse(self.allocator, &response);
+            return error.ToolCallFailed;
+        };
+        
+        if (content != .array) {
+            protocol.deinitResponse(self.allocator, &response);
+            return error.ToolCallFailed;
+        }
 
         // Make a copy of the content array
         var content_copy = try std.ArrayList(protocol.Value).initCapacity(
@@ -826,6 +821,9 @@ pub const Client = struct {
         for (content.array.items) |item| {
             try content_copy.append(try protocol.cloneValue(self.allocator, item));
         }
+
+        // Clean up response now that we've extracted what we need
+        protocol.deinitResponse(self.allocator, &response);
 
         return ToolResult{
             .is_error = is_error,
@@ -863,9 +861,14 @@ pub const Client = struct {
                 std.debug.print("✅ Found response in queue for ", .{});
                 debugPrintId("", id);
                 
-                const response = try protocol.cloneResponse(self.allocator, resp.*);
+                // Make a copy for the caller
+                const response_copy = try protocol.cloneResponse(self.allocator, resp.*);
+                
+                // Clean up and remove the queued response
+                protocol.deinitResponse(self.allocator, resp);
                 _ = self.message_queue.orderedRemove(index);
-                return response;
+                
+                return response_copy;
             }
         }
         
@@ -884,12 +887,23 @@ pub const Client = struct {
                 // Make a copy of the response before removing the request state
                 const response_copy = try protocol.cloneResponse(self.allocator, response);
                 
+                // Make a copy of the request state before swapRemove
+                var req_copy = req;
+                
                 // Remove from pending requests
                 _ = self.pending_requests.swapRemove(index);
+                
+                // Clean up the request state
+                req_copy.deinit();
                 
                 return response_copy;
             }
         }
+        
+        // Create an arena for the timeout handling
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         
         // Main waiting loop
         var loops: u32 = 0;
@@ -914,8 +928,14 @@ pub const Client = struct {
                     // Make a copy of the response before removing the request state
                     const response_copy = try protocol.cloneResponse(self.allocator, response);
                     
+                    // Make a copy of the request state before swapRemove
+                    var req_copy = req;
+                    
                     // Remove from pending requests
                     _ = self.pending_requests.swapRemove(index);
+                    
+                    // Clean up the request state
+                    req_copy.deinit();
                     
                     return response_copy;
                 }
@@ -925,13 +945,12 @@ pub const Client = struct {
             if (timer) |*t| {
                 if (timeout_ms.? <= t.read() / std.time.ns_per_ms) {
                     std.debug.print("waitForResponse: timeout exceeded\n", .{});
-                    // Send cancellation
-                    var cancel_params = std.json.ObjectMap.init(self.allocator);
-                    errdefer cancel_params.deinit();
-
-                    try cancel_params.put("id", id);
+                    
+                    // Send cancellation using arena for temporary objects
+                    var cancel_params = std.json.ObjectMap.init(arena);
+                    try cancel_params.put("id", try protocol.cloneValue(arena, id));
                     try cancel_params.put("reason", .{ .string = "Timeout exceeded" });
-
+                    
                     try self.sendNotification("notifications/cancelled", .{ .object = cancel_params });
                     return error.Timeout;
                 }
@@ -977,7 +996,7 @@ pub const Client = struct {
             defer self.allocator.free(message);
             std.debug.print("Processing message: {s}\n", .{message});
             
-            var parsed = try std.json.parseFromSlice(
+            const parsed = try std.json.parseFromSlice(
                 std.json.Value,
                 self.allocator,
                 message,
@@ -988,11 +1007,11 @@ pub const Client = struct {
             const json = parsed.value;
             
             if (protocol.isResponse(json)) {
-                try self.handleResponse(json);
+                try self.handleResponse(json, null);
             } else if (protocol.isNotification(json)) {
-                try self.handleNotification(json);
+                try self.handleNotification(json, null);
             } else if (protocol.isRequest(json)) {
-                try self.handleRequest(json);
+                try self.handleRequest(json, null);
             }
         }
     }
@@ -1020,38 +1039,41 @@ pub const Client = struct {
     }
 
     fn processOneMessage(self: *Client) !void {
-        // Read a message
+        // Create an arena for temporary allocations
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        
+        // Read message using the client's allocator (still needs explicit free)
         const message = try self.readMessage();
         defer if (message.len > 0) self.allocator.free(message);
         if (message.len == 0) return;
-
+        
         // Debug log
         std.debug.print("processOneMessage: Received message of length {}\n", .{message.len});
         if (self.debug_file) |file| {
             try file.writer().print("Received: {s}\n", .{message});
         }
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(
+        
+        // Parse using arena - no need to clean up parsed
+        const parsed = try std.json.parseFromSlice(
             std.json.Value,
-            self.allocator,
+            arena,
             message,
             .{},
         );
-        defer parsed.deinit();
-
         const json = parsed.value;
-
-        // Check if this is a request, response, or notification
+        
+        // Process message based on type, passing arena to handlers
         if (protocol.isResponse(json)) {
             std.debug.print("processOneMessage: Handling response\n", .{});
-            try self.handleResponse(json);
+            try self.handleResponse(json, arena);
         } else if (protocol.isNotification(json)) {
             std.debug.print("processOneMessage: Handling notification\n", .{});
-            try self.handleNotification(json);
+            try self.handleNotification(json, arena);
         } else if (protocol.isRequest(json)) {
             std.debug.print("processOneMessage: Handling request\n", .{});
-            try self.handleRequest(json);
+            try self.handleRequest(json, arena);
         } else {
             // Invalid message
             std.debug.print("processOneMessage: Invalid message format\n", .{});
@@ -1099,15 +1121,25 @@ pub const Client = struct {
         }
     }
 
-    fn handleResponse(self: *Client, json: protocol.Value) !void {
+    fn handleResponse(self: *Client, json: protocol.Value, arena_opt: ?std.mem.Allocator) !void {
         // Extract ID
         const id = json.object.get("id") orelse return;
         
         std.debug.print("Response received with ", .{});
         debugPrintId("response", id);
 
-        // Parse response
-        const response = try protocol.parseResponse(self.allocator, json);
+        // Parse response using either arena or client allocator
+        var response: protocol.Response = undefined;
+        var need_clone = false;
+        
+        if (arena_opt) |arena| {
+            // Using arena allocator for temporary parsing
+            response = try protocol.parseResponseArena(arena, json);
+            need_clone = true;
+        } else {
+            // Using client's allocator directly
+            response = try protocol.parseResponse(self.allocator, json);
+        }
         
         // First check if this matches any pending request
         var matched = false;
@@ -1117,7 +1149,14 @@ pub const Client = struct {
             
             if (compareIds(req.id, id)) {
                 req.completed = true;
-                req.response = response;
+                
+                // If using arena, make a permanent copy for the request state
+                if (need_clone) {
+                    req.response = try protocol.cloneResponse(self.allocator, response);
+                } else {
+                    req.response = response;
+                }
+                
                 matched = true;
                 std.debug.print("✅ MATCHED! Response for request at index {}\n", .{index});
                 break;
@@ -1130,11 +1169,23 @@ pub const Client = struct {
         if (!matched) {
             std.debug.print("⚠️ Queueing unmatched response for ", .{});
             debugPrintId("", id);
-            try self.message_queue.append(response);
+            
+            // If using arena, make a permanent copy for the queue
+            if (need_clone) {
+                const permanent_response = try protocol.cloneResponse(self.allocator, response);
+                try self.message_queue.append(permanent_response);
+            } else {
+                try self.message_queue.append(response);
+            }
         }
     }
+    
 
-    fn handleNotification(self: *Client, json: protocol.Value) !void {
+    fn handleNotification(self: *Client, json: protocol.Value, arena_opt: ?std.mem.Allocator) !void {
+        // Currently not using arena_opt, but keeping the parameter for future use
+        // TODO: Consider using arena for temporary allocations if needed in the future
+        _ = arena_opt; // Silence unused parameter warning
+        
         const method = json.object.get("method") orelse return;
         if (method != .string) return;
 
@@ -1207,7 +1258,11 @@ pub const Client = struct {
         }
     }
 
-    fn handleRequest(self: *Client, json: protocol.Value) !void {
+    fn handleRequest(self: *Client, json: protocol.Value, arena_opt: ?std.mem.Allocator) !void {
+        // Currently not using arena_opt, but keeping the parameter for future use
+        // TODO: Consider using arena for temporary allocations if needed in the future
+        _ = arena_opt; // Silence unused parameter warning
+        
         const method = json.object.get("method") orelse return;
         if (method != .string) return;
 

@@ -44,6 +44,17 @@ pub fn convertNativeToJson(allocator: std.mem.Allocator, value: anytype) !protoc
             }
             break :blk .{ .array = array };
         },
+        .Struct => blk: {
+            var obj = std.json.ObjectMap.init(allocator);
+
+            inline for (std.meta.fields(T)) |field| {
+                const field_value = @field(value, field.name);
+                const field_json = try convertNativeToJson(allocator, field_value);
+                try obj.put(try allocator.dupe(u8, field.name), field_json);
+            }
+
+            break :blk .{ .object = obj };
+        },
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     };
 }

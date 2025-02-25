@@ -53,6 +53,24 @@ pub fn build(b: *std.Build) void {
     const run_echo_step = b.step("run-echo", "Run the echo example");
     run_echo_step.dependOn(&run_echo_cmd.step);
 
+    // Build the client example
+    const client_example = b.addExecutable(.{
+        .name = "client-example",
+        .root_source_file = b.path("examples/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_example.root_module.addImport("zmcp", zmcp_module);
+    b.installArtifact(client_example);
+
+    // Add a run step for the client example
+    const run_client_cmd = b.addRunArtifact(client_example);
+    if (b.args) |args| {
+        run_client_cmd.addArgs(args);
+    }
+    const run_client_step = b.step("run-client", "Run the client example");
+    run_client_step.dependOn(&run_client_cmd.step);
+
     // Unit tests
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/zmcp.zig"),

@@ -365,6 +365,14 @@ pub fn serializeMessage(allocator: std.mem.Allocator, message: anytype) ![]const
     return try buf.toOwnedSlice();
 }
 
+// Helper to serialize a JSON-RPC message to a string using an arena
+pub fn serializeMessageArena(arena: std.mem.Allocator, message: anytype) ![]const u8 {
+    var buf = std.ArrayList(u8).init(arena);
+    
+    try std.json.stringify(message, .{ .emit_null_optional_fields = false }, buf.writer());
+    return buf.items; // No need to call toOwnedSlice since arena owns this
+}
+
 test "Request.fromJson - valid request" {
     const allocator = std.testing.allocator;
 

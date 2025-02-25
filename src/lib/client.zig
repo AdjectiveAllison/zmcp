@@ -5,7 +5,7 @@ const types = @import("types.zig");
 // Debug helper function to print ID values in detail
 fn debugPrintId(prefix: []const u8, id: protocol.Value) void {
     std.debug.print("{s} ID type: {s}, ", .{ prefix, @tagName(id) });
-    
+
     switch (id) {
         .integer => std.debug.print("value: {}\n", .{id.integer}),
         .string => std.debug.print("value: \"{s}\"\n", .{id.string}),
@@ -17,7 +17,7 @@ fn debugPrintId(prefix: []const u8, id: protocol.Value) void {
 fn compareIds(a: protocol.Value, b: protocol.Value) bool {
     // Direct match
     if (protocol.valuesEqual(a, b)) return true;
-    
+
     // Handle integer-string conversions
     if (a == .integer and b == .string) {
         // Convert integer to string and compare
@@ -25,14 +25,14 @@ fn compareIds(a: protocol.Value, b: protocol.Value) bool {
         const str = std.fmt.bufPrint(&buf, "{d}", .{a.integer}) catch return false;
         return std.mem.eql(u8, str, b.string);
     }
-    
+
     if (a == .string and b == .integer) {
         // Convert integer to string and compare
         var buf: [20]u8 = undefined;
         const str = std.fmt.bufPrint(&buf, "{d}", .{b.integer}) catch return false;
         return std.mem.eql(u8, str, a.string);
     }
-    
+
     return false;
 }
 
@@ -119,12 +119,12 @@ const RequestState = struct {
         if (self.response) |*resp| {
             protocol.deinitResponse(self.allocator, resp);
         }
-        
+
         // Clean up ID
         if (self.id == .string) {
             self.allocator.free(self.id.string);
         }
-        
+
         // Clean up progress token
         if (self.progress_token) |*token| {
             protocol.cleanupValue(self.allocator, token);
@@ -336,7 +336,7 @@ pub const Client = struct {
             req.deinit();
         }
         self.pending_requests.deinit();
-        
+
         // Clean up message queue
         for (self.message_queue.items) |*msg| {
             protocol.deinitResponse(self.allocator, msg);
@@ -594,7 +594,9 @@ pub const Client = struct {
         const id = self.nextId();
         try self.sendRequest("tools/list", null, id);
 
-        const response = try self.waitForResponseSimple(id);
+        var response = try self.waitForResponseSimple(id);
+        defer protocol.deinitResponse(self.allocator, &response);
+        
         if (response.@"error" != null) {
             return error.ListToolsFailed;
         }
@@ -610,6 +612,7 @@ pub const Client = struct {
             self.allocator,
             tools.array.items.len,
         );
+        
         for (tools.array.items) |tool| {
             try tools_copy.append(try protocol.cloneValue(self.allocator, tool));
         }
@@ -677,9 +680,6 @@ pub const Client = struct {
                         return error.ToolCallInvalidResult;
                     }
                 }
-
-                // For complex types, we'd implement JSON parsing
-                // This is simplified and would need expansion for struct types
             }
         }
 
@@ -765,7 +765,7 @@ pub const Client = struct {
 
         // Create a unique ID for this request
         const id = self.nextId();
-        
+
         // Create request state with progress handling info - this is persistent storage
         const req_state = RequestState{
             .id = id,
@@ -794,7 +794,7 @@ pub const Client = struct {
             protocol.deinitResponse(self.allocator, &response);
             return error.ToolCallFailed;
         };
-        
+
         if (result != .object) {
             protocol.deinitResponse(self.allocator, &response);
             return error.ToolCallFailed;
@@ -806,7 +806,7 @@ pub const Client = struct {
             protocol.deinitResponse(self.allocator, &response);
             return error.ToolCallFailed;
         };
-        
+
         if (content != .array) {
             protocol.deinitResponse(self.allocator, &response);
             return error.ToolCallFailed;
@@ -835,131 +835,120 @@ pub const Client = struct {
     fn waitForResponse(self: *Client, id: protocol.Value, timeout_ms: ?u32) !protocol.Response {
         std.debug.print("waitForResponse: Looking for ", .{});
         debugPrintId("", id);
-        
+
         // Don't create a new request state as the calling function should have already created one
         var timer: ?std.time.Timer = null;
         if (timeout_ms != null) {
             timer = try std.time.Timer.start();
         }
-        
+
         // Debug: show current queue and pending requests
         std.debug.print("Current queue size: {d}\n", .{self.message_queue.items.len});
         std.debug.print("Current pending requests: {d}\n", .{self.pending_requests.items.len});
-        
+
         // First check if we already have this response in our queue
         for (self.message_queue.items, 0..) |*resp, index| {
             // Skip responses with null IDs (shouldn't happen per protocol but being defensive)
             if (resp.id == null) continue;
-            
+
             debugPrintId("Checking queued response", resp.id.?);
-            
+
             const matches = compareIds(resp.id.?, id);
-            std.debug.print("Queue item {d} matches: {}\n", .{index, matches});
-            
+            std.debug.print("Queue item {d} matches: {}\n", .{ index, matches });
+
             if (matches) {
                 // Found it in the queue, remove and return it
                 std.debug.print("✅ Found response in queue for ", .{});
                 debugPrintId("", id);
-                
+
                 // Make a copy for the caller
                 const response_copy = try protocol.cloneResponse(self.allocator, resp.*);
-                
+
                 // Clean up and remove the queued response
                 protocol.deinitResponse(self.allocator, resp);
                 _ = self.message_queue.orderedRemove(index);
-                
+
                 return response_copy;
             }
         }
-        
+
         // Process any messages that are immediately available
         try self.processAvailable();
-        
+
         // Check if our specific request is now completed
         for (self.pending_requests.items, 0..) |req, index| {
             std.debug.print("After processing, checking pending request at index {}: ", .{index});
             debugPrintId("", req.id);
-            
+
             if (compareIds(req.id, id) and req.completed) {
                 std.debug.print("✅ waitForResponse: request ID is now completed\n", .{});
                 const response = req.response.?;
-                
-                // Make a copy of the response before removing the request state
+
+                // Make a copy for the caller
                 const response_copy = try protocol.cloneResponse(self.allocator, response);
-                
-                // Make a copy of the request state before swapRemove
-                var req_copy = req;
-                
-                // Remove from pending requests
+
+                // Clean up and remove the request
+                var req_copy = req; // Copy before swapRemove
                 _ = self.pending_requests.swapRemove(index);
-                
-                // Clean up the request state
                 req_copy.deinit();
-                
+
                 return response_copy;
             }
         }
-        
+
         // Create an arena for the timeout handling
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        
+
         // Main waiting loop
         var loops: u32 = 0;
         while (true) {
             loops += 1;
             if (loops % 1000 == 0) {
-                std.debug.print("waitForResponse: still waiting after {} loops for ID {}\n", .{
-                    loops,
-                    if (id == .integer) id.integer else @as(i64, 0)
-                });
+                std.debug.print("waitForResponse: still waiting after {} loops for ID {}\n", .{ loops, if (id == .integer) id.integer else @as(i64, 0) });
             }
-            
+
             // Process any incoming messages
             try self.processOneMessage();
-            
+
             // Check if our request has completed
             for (self.pending_requests.items, 0..) |req, index| {
-                if (protocol.valuesEqual(req.id, id) and req.completed) {
+                if (compareIds(req.id, id) and req.completed) {
                     std.debug.print("waitForResponse: found completed request after {} loops\n", .{loops});
                     const response = req.response.?;
-                    
-                    // Make a copy of the response before removing the request state
+
+                    // Make a copy for the caller
                     const response_copy = try protocol.cloneResponse(self.allocator, response);
-                    
-                    // Make a copy of the request state before swapRemove
-                    var req_copy = req;
-                    
-                    // Remove from pending requests
+
+                    // Clean up and remove the request
+                    var req_copy = req; // Copy before swapRemove
                     _ = self.pending_requests.swapRemove(index);
-                    
-                    // Clean up the request state
                     req_copy.deinit();
-                    
+
                     return response_copy;
                 }
             }
-            
+
             // Check timeout
             if (timer) |*t| {
                 if (timeout_ms.? <= t.read() / std.time.ns_per_ms) {
                     std.debug.print("waitForResponse: timeout exceeded\n", .{});
-                    
+
                     // Send cancellation using arena for temporary objects
                     var cancel_params = std.json.ObjectMap.init(arena);
                     try cancel_params.put("id", try protocol.cloneValue(arena, id));
                     try cancel_params.put("reason", .{ .string = "Timeout exceeded" });
-                    
+
                     try self.sendNotification("notifications/cancelled", .{ .object = cancel_params });
                     return error.Timeout;
                 }
             }
-            
+
             // Yield to avoid busy waiting
             std.time.sleep(1 * std.time.ns_per_ms);
         }
-        
+
         // This should never be reached, but needed to satisfy the compiler
         return error.ResponseNotReceived;
     }
@@ -969,13 +958,20 @@ pub const Client = struct {
             return error.ServerDoesNotSupportLogging;
         }
 
-        var params = std.json.ObjectMap.init(self.allocator);
-        try params.put("level", .{ .string = try self.allocator.dupe(u8, level) });
+        // Create an arena for this operation
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var params = std.json.ObjectMap.init(arena);
+        try params.put("level", .{ .string = try arena.dupe(u8, level) });
 
         const id = self.nextId();
         try self.sendRequest("logging/setLevel", .{ .object = params }, id);
 
-        const response = try self.waitForResponseSimple(id);
+        var response = try self.waitForResponseSimple(id);
+        defer protocol.deinitResponse(self.allocator, &response);
+        
         if (response.@"error" != null) {
             return error.SetLogLevelFailed;
         }
@@ -986,8 +982,13 @@ pub const Client = struct {
             try self.processOneMessage();
         }
     }
-    
+
     pub fn processAvailable(self: *Client) !void {
+        // Create an arena for this batch processing
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
         // Read and process any available messages without blocking
         while (true) {
             const message = try self.readMessage();
@@ -996,22 +997,22 @@ pub const Client = struct {
             defer self.allocator.free(message);
             std.debug.print("Processing message: {s}\n", .{message});
             
+            // Parse using arena
             const parsed = try std.json.parseFromSlice(
                 std.json.Value,
-                self.allocator,
+                arena,
                 message,
                 .{},
             );
-            defer parsed.deinit();
             
             const json = parsed.value;
             
             if (protocol.isResponse(json)) {
-                try self.handleResponse(json, null);
+                try self.handleResponse(json, arena);
             } else if (protocol.isNotification(json)) {
-                try self.handleNotification(json, null);
+                try self.handleNotification(json, arena);
             } else if (protocol.isRequest(json)) {
-                try self.handleRequest(json, null);
+                try self.handleRequest(json, arena);
             }
         }
     }
@@ -1043,18 +1044,18 @@ pub const Client = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        
+
         // Read message using the client's allocator (still needs explicit free)
         const message = try self.readMessage();
         defer if (message.len > 0) self.allocator.free(message);
         if (message.len == 0) return;
-        
+
         // Debug log
         std.debug.print("processOneMessage: Received message of length {}\n", .{message.len});
         if (self.debug_file) |file| {
             try file.writer().print("Received: {s}\n", .{message});
         }
-        
+
         // Parse using arena - no need to clean up parsed
         const parsed = try std.json.parseFromSlice(
             std.json.Value,
@@ -1063,7 +1064,7 @@ pub const Client = struct {
             .{},
         );
         const json = parsed.value;
-        
+
         // Process message based on type, passing arena to handlers
         if (protocol.isResponse(json)) {
             std.debug.print("processOneMessage: Handling response\n", .{});
@@ -1094,15 +1095,15 @@ pub const Client = struct {
                         .revents = 0,
                     },
                 };
-                
+
                 const available = try std.posix.poll(&poll_fds, 0); // 0 = non-blocking
                 const has_input = (available > 0) and ((poll_fds[0].revents & std.posix.POLL.IN) != 0);
-                
+
                 if (!has_input) {
                     // No data available
                     return &[_]u8{};
                 }
-                
+
                 // Data available, read it
                 var buf: [8192]u8 = undefined;
                 if (try stdio.stdout.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
@@ -1124,14 +1125,14 @@ pub const Client = struct {
     fn handleResponse(self: *Client, json: protocol.Value, arena_opt: ?std.mem.Allocator) !void {
         // Extract ID
         const id = json.object.get("id") orelse return;
-        
+
         std.debug.print("Response received with ", .{});
         debugPrintId("response", id);
 
         // Parse response using either arena or client allocator
         var response: protocol.Response = undefined;
         var need_clone = false;
-        
+
         if (arena_opt) |arena| {
             // Using arena allocator for temporary parsing
             response = try protocol.parseResponseArena(arena, json);
@@ -1140,23 +1141,23 @@ pub const Client = struct {
             // Using client's allocator directly
             response = try protocol.parseResponse(self.allocator, json);
         }
-        
+
         // First check if this matches any pending request
         var matched = false;
         for (self.pending_requests.items, 0..) |*req, index| {
             std.debug.print("Comparing with pending request at index {}: ", .{index});
             debugPrintId("request", req.id);
-            
+
             if (compareIds(req.id, id)) {
                 req.completed = true;
-                
+
                 // If using arena, make a permanent copy for the request state
                 if (need_clone) {
                     req.response = try protocol.cloneResponse(self.allocator, response);
                 } else {
                     req.response = response;
                 }
-                
+
                 matched = true;
                 std.debug.print("✅ MATCHED! Response for request at index {}\n", .{index});
                 break;
@@ -1164,12 +1165,12 @@ pub const Client = struct {
                 std.debug.print("❌ NO MATCH for request at index {}\n", .{index});
             }
         }
-        
+
         // If not matched, queue it for later processing
         if (!matched) {
             std.debug.print("⚠️ Queueing unmatched response for ", .{});
             debugPrintId("", id);
-            
+
             // If using arena, make a permanent copy for the queue
             if (need_clone) {
                 const permanent_response = try protocol.cloneResponse(self.allocator, response);
@@ -1179,13 +1180,12 @@ pub const Client = struct {
             }
         }
     }
-    
 
     fn handleNotification(self: *Client, json: protocol.Value, arena_opt: ?std.mem.Allocator) !void {
         // Currently not using arena_opt, but keeping the parameter for future use
         // TODO: Consider using arena for temporary allocations if needed in the future
         _ = arena_opt; // Silence unused parameter warning
-        
+
         const method = json.object.get("method") orelse return;
         if (method != .string) return;
 
@@ -1262,7 +1262,7 @@ pub const Client = struct {
         // Currently not using arena_opt, but keeping the parameter for future use
         // TODO: Consider using arena for temporary allocations if needed in the future
         _ = arena_opt; // Silence unused parameter warning
-        
+
         const method = json.object.get("method") orelse return;
         if (method != .string) return;
 
@@ -1292,11 +1292,15 @@ pub const Client = struct {
         std.debug.print("Sending request with method: {s}, ", .{method});
         debugPrintId("request", id);
         
+        // Create an arena for this request
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        
         // Display pending requests before adding
         std.debug.print("Current pending requests: {d}\n", .{self.pending_requests.items.len});
         
-        // Only add to pending requests if this is a method that expects a response
-        // and if we're not using an existing request state (like in callTool)
+        // Only add to pending requests if not already present
         var found = false;
         for (self.pending_requests.items) |*req| {
             if (compareIds(req.id, id)) {
@@ -1326,8 +1330,8 @@ pub const Client = struct {
             .params = params,
         };
 
-        const message = try self.serializeMessage(request);
-        defer self.allocator.free(message);
+        // Serialize using arena
+        const message = try protocol.serializeMessageArena(arena, request);
 
         if (self.debug_file) |file| {
             try file.writer().print("Sending request: {s}\n", .{message});
@@ -1345,6 +1349,11 @@ pub const Client = struct {
     }
 
     fn sendResponse(self: *Client, id: protocol.Value, result: protocol.Value, error_value: ?protocol.ResponseError) !void {
+        // Create an arena for this response
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        
         const response = protocol.Response{
             .jsonrpc = "2.0",
             .id = id,
@@ -1352,8 +1361,8 @@ pub const Client = struct {
             .@"error" = error_value,
         };
 
-        const message = try self.serializeMessage(response);
-        defer self.allocator.free(message);
+        // Serialize using arena
+        const message = try protocol.serializeMessageArena(arena, response);
 
         if (self.debug_file) |file| {
             try file.writer().print("Sending response: {s}\n", .{message});
@@ -1371,14 +1380,19 @@ pub const Client = struct {
     }
 
     fn sendNotification(self: *Client, method: []const u8, params: ?protocol.Value) !void {
+        // Create an arena for this notification
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
         const notification = protocol.Notification{
             .jsonrpc = "2.0",
             .method = method,
             .params = params,
         };
 
-        const message = try self.serializeMessage(notification);
-        defer self.allocator.free(message);
+        // Serialize using arena
+        const message = try protocol.serializeMessageArena(arena, notification);
 
         if (self.debug_file) |file| {
             try file.writer().print("Sending notification: {s}\n", .{message});

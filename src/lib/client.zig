@@ -2,6 +2,40 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const types = @import("types.zig");
 
+// Debug helper function to print ID values in detail
+fn debugPrintId(prefix: []const u8, id: protocol.Value) void {
+    std.debug.print("{s} ID type: {s}, ", .{ prefix, @tagName(id) });
+    
+    switch (id) {
+        .integer => std.debug.print("value: {}\n", .{id.integer}),
+        .string => std.debug.print("value: \"{s}\"\n", .{id.string}),
+        else => std.debug.print("unexpected type\n", .{}),
+    }
+}
+
+// Enhanced ID comparison function
+fn compareIds(a: protocol.Value, b: protocol.Value) bool {
+    // Direct match
+    if (protocol.valuesEqual(a, b)) return true;
+    
+    // Handle integer-string conversions
+    if (a == .integer and b == .string) {
+        // Convert integer to string and compare
+        var buf: [20]u8 = undefined; // Enough for any i64
+        const str = std.fmt.bufPrint(&buf, "{d}", .{a.integer}) catch return false;
+        return std.mem.eql(u8, str, b.string);
+    }
+    
+    if (a == .string and b == .integer) {
+        // Convert integer to string and compare
+        var buf: [20]u8 = undefined;
+        const str = std.fmt.bufPrint(&buf, "{d}", .{b.integer}) catch return false;
+        return std.mem.eql(u8, str, a.string);
+    }
+    
+    return false;
+}
+
 pub const InitializeOptions = struct {
     name: []const u8,
     version: []const u8,
@@ -118,25 +152,25 @@ pub const ClientBuilder = struct {
     user_context: ?*anyopaque = null,
     enable_sampling: bool = false,
     enable_roots: bool = false,
-    
+
     pub fn init(allocator: std.mem.Allocator) ClientBuilder {
         return .{
             .allocator = allocator,
         };
     }
-    
+
     pub fn withName(self: ClientBuilder, name: []const u8) ClientBuilder {
         var result = self;
         result.name = name;
         return result;
     }
-    
+
     pub fn withVersion(self: ClientBuilder, version: []const u8) ClientBuilder {
         var result = self;
         result.version = version;
         return result;
     }
-    
+
     pub fn withCommand(self: ClientBuilder, command: []const u8, args: ?[]const []const u8) ClientBuilder {
         var result = self;
         result.transport_type = .Stdio;
@@ -144,14 +178,14 @@ pub const ClientBuilder = struct {
         result.args = args;
         return result;
     }
-    
+
     pub fn withHttpEndpoint(self: ClientBuilder, endpoint: []const u8) ClientBuilder {
         var result = self;
         result.transport_type = .Http;
         result.http_endpoint = endpoint;
         return result;
     }
-    
+
     pub fn withStdio(self: ClientBuilder) ClientBuilder {
         var result = self;
         result.transport_type = .Stdio;
@@ -159,61 +193,61 @@ pub const ClientBuilder = struct {
         result.args = null;
         return result;
     }
-    
+
     pub fn withDebugLogging(self: ClientBuilder, enable: bool) ClientBuilder {
         var result = self;
         result.enable_debug = enable;
         return result;
     }
-    
+
     pub fn withProgressHandler(self: ClientBuilder, handler: *const fn (token: protocol.Value, progress: f64, total: ?f64, context: ?*anyopaque) void) ClientBuilder {
         var result = self;
         result.on_progress = handler;
         return result;
     }
-    
+
     pub fn withLogHandler(self: ClientBuilder, handler: *const fn (level: []const u8, message: []const u8, context: ?*anyopaque) void) ClientBuilder {
         var result = self;
         result.on_log = handler;
         return result;
     }
-    
+
     pub fn withToolsChangedHandler(self: ClientBuilder, handler: *const fn (context: ?*anyopaque) void) ClientBuilder {
         var result = self;
         result.on_tools_changed = handler;
         return result;
     }
-    
+
     pub fn withResourcesChangedHandler(self: ClientBuilder, handler: *const fn (context: ?*anyopaque) void) ClientBuilder {
         var result = self;
         result.on_resources_changed = handler;
         return result;
     }
-    
+
     pub fn withPromptsChangedHandler(self: ClientBuilder, handler: *const fn (context: ?*anyopaque) void) ClientBuilder {
         var result = self;
         result.on_prompts_changed = handler;
         return result;
     }
-    
+
     pub fn withUserContext(self: ClientBuilder, context: ?*anyopaque) ClientBuilder {
         var result = self;
         result.user_context = context;
         return result;
     }
-    
+
     pub fn withSamplingEnabled(self: ClientBuilder, enable: bool) ClientBuilder {
         var result = self;
         result.enable_sampling = enable;
         return result;
     }
-    
+
     pub fn withRootsEnabled(self: ClientBuilder, enable: bool) ClientBuilder {
         var result = self;
         result.enable_roots = enable;
         return result;
     }
-    
+
     pub fn build(self: ClientBuilder) !*Client {
         // Create callback context
         const callback_context = CallbackContext{
@@ -225,16 +259,16 @@ pub const ClientBuilder = struct {
             .on_prompts_changed = self.on_prompts_changed,
             .user_context = self.user_context,
         };
-        
+
         // Create client instance
         const client = try Client.init(self.allocator, callback_context);
         errdefer client.deinit();
-        
+
         // Setup debug logging if requested
         if (self.enable_debug) {
             try client.enableDebugLogging();
         }
-        
+
         // Setup transport based on type
         switch (self.transport_type) {
             .Stdio => {
@@ -254,7 +288,7 @@ pub const ClientBuilder = struct {
                 }
             },
         }
-        
+
         // Initialize the client
         try client.initialize(.{
             .name = self.name,
@@ -262,7 +296,7 @@ pub const ClientBuilder = struct {
             .enable_sampling = self.enable_sampling,
             .enable_roots = self.enable_roots,
         });
-        
+
         return client;
     }
 };
@@ -279,6 +313,7 @@ pub const Client = struct {
     capabilities: CapabilityInfo = .{},
     next_id: u32 = 1,
     pending_requests: std.ArrayList(RequestState),
+    message_queue: std.ArrayList(protocol.Response),
     callback_context: CallbackContext,
     debug_file: ?std.fs.File = null,
 
@@ -288,11 +323,12 @@ pub const Client = struct {
             .allocator = allocator,
             .transport = undefined, // Will be set by connectToCommand or other connect methods
             .pending_requests = std.ArrayList(RequestState).init(allocator),
+            .message_queue = std.ArrayList(protocol.Response).init(allocator),
             .callback_context = callback_context,
         };
         return self;
     }
-    
+
     pub fn builder(allocator: std.mem.Allocator) ClientBuilder {
         return ClientBuilder.init(allocator);
     }
@@ -303,6 +339,12 @@ pub const Client = struct {
             req.deinit();
         }
         self.pending_requests.deinit();
+        
+        // Clean up message queue
+        for (self.message_queue.items) |*msg| {
+            protocol.deinitResponse(self.allocator, msg);
+        }
+        self.message_queue.deinit();
 
         // Clean up transport
         switch (self.transport) {
@@ -335,7 +377,7 @@ pub const Client = struct {
         if (self.server_info.version.len > 0) {
             self.allocator.free(self.server_info.version);
         }
-        
+
         // Clean up protocol version if it's not the default
         if (self.protocol_version.ptr != "2024-11-05".ptr) {
             self.allocator.free(self.protocol_version);
@@ -399,15 +441,17 @@ pub const Client = struct {
     }
 
     pub fn initialize(self: *Client, options: InitializeOptions) !void {
+        std.debug.print("Client initializing...\n", .{});
+
         // Create capabilities object
         var capabilities = std.json.ObjectMap.init(self.allocator);
         defer capabilities.deinit();
-        
+
         if (options.enable_sampling) {
             const sampling_obj = std.json.ObjectMap.init(self.allocator);
             try capabilities.put("sampling", .{ .object = sampling_obj });
         }
-        
+
         if (options.enable_roots) {
             const roots_obj = std.json.ObjectMap.init(self.allocator);
             try capabilities.put("roots", .{ .object = roots_obj });
@@ -416,11 +460,11 @@ pub const Client = struct {
         // Create client info object
         var client_info = std.json.ObjectMap.init(self.allocator);
         defer client_info.deinit();
-        
+
         const name_copy = try self.allocator.dupe(u8, options.name);
         errdefer self.allocator.free(name_copy);
         try client_info.put("name", .{ .string = name_copy });
-        
+
         const version_copy = try self.allocator.dupe(u8, options.version);
         errdefer self.allocator.free(version_copy);
         try client_info.put("version", .{ .string = version_copy });
@@ -428,28 +472,33 @@ pub const Client = struct {
         // Create params
         var params = std.json.ObjectMap.init(self.allocator);
         defer params.deinit();
-        
+
         const protocol_copy = try self.allocator.dupe(u8, self.protocol_version);
         errdefer self.allocator.free(protocol_copy);
         try params.put("protocolVersion", .{ .string = protocol_copy });
-        
+
         // Make clones of the objects to transfer ownership to params
         try params.put("capabilities", try protocol.cloneValue(self.allocator, .{ .object = capabilities }));
         try params.put("clientInfo", try protocol.cloneValue(self.allocator, .{ .object = client_info }));
 
         // Send initialize request
         const id = self.nextId();
+        std.debug.print("Sending initialize request with id: {}\n", .{id.integer});
         try self.sendRequest("initialize", .{ .object = params }, id);
 
         // Wait for response
+        std.debug.print("Waiting for initialize response...\n", .{});
         const response = try self.waitForResponseSimple(id);
+        std.debug.print("Received initialize response\n", .{});
 
         try self.processInitializeResponse(response);
 
         // Send initialized notification
+        std.debug.print("Sending initialized notification\n", .{});
         try self.sendNotification("initialized", null);
 
         self.initialized = true;
+        std.debug.print("Client initialization complete\n", .{});
     }
 
     fn processInitializeResponse(self: *Client, response: protocol.Response) !void {
@@ -582,46 +631,46 @@ pub const Client = struct {
     ) !ResultType {
         var result = try self.callTool(name, args, options);
         defer result.deinit(self.allocator);
-        
+
         if (result.is_error) {
             return error.ToolCallFailed;
         }
-        
+
         if (result.content.len == 0) {
             return error.ToolCallInvalidResult;
         }
-        
+
         // Find text content
         for (result.content) |content| {
             if (content != .object) continue;
-            
+
             const content_type = content.object.get("type") orelse continue;
             if (content_type != .string) continue;
-            
+
             if (std.mem.eql(u8, content_type.string, "text")) {
                 const text = content.object.get("text") orelse continue;
                 if (text != .string) continue;
-                
+
                 // For string result type
                 if (ResultType == []const u8) {
                     return self.allocator.dupe(u8, text.string);
                 }
-                
+
                 // For integer result type
                 if (ResultType == i64 or ResultType == i32 or ResultType == i16 or ResultType == i8) {
                     return std.fmt.parseInt(ResultType, text.string, 10) catch return error.ToolCallInvalidResult;
                 }
-                
+
                 // For unsigned result type
                 if (ResultType == u64 or ResultType == u32 or ResultType == u16 or ResultType == u8) {
                     return std.fmt.parseInt(ResultType, text.string, 10) catch return error.ToolCallInvalidResult;
                 }
-                
+
                 // For float result type
                 if (ResultType == f64 or ResultType == f32) {
                     return std.fmt.parseFloat(ResultType, text.string) catch return error.ToolCallInvalidResult;
                 }
-                
+
                 // For boolean result type
                 if (ResultType == bool) {
                     if (std.mem.eql(u8, text.string, "true")) {
@@ -632,15 +681,15 @@ pub const Client = struct {
                         return error.ToolCallInvalidResult;
                     }
                 }
-                
+
                 // For complex types, we'd implement JSON parsing
                 // This is simplified and would need expansion for struct types
             }
         }
-        
+
         return error.ToolCallInvalidResult;
     }
-    
+
     /// Calls a tool and returns the text response
     pub fn callToolText(
         self: *Client,
@@ -650,7 +699,7 @@ pub const Client = struct {
     ) ![]const u8 {
         return self.callToolAs([]const u8, name, args, options);
     }
-    
+
     /// Main tool call method
     pub fn callTool(
         self: *Client,
@@ -661,6 +710,7 @@ pub const Client = struct {
         if (!self.capabilities.tools) {
             return error.ServerDoesNotSupportTools;
         }
+        std.debug.print("Sending tool call to: {s}\n", .{name});
 
         // Create params with proper cleanup
         var params = std.json.ObjectMap.init(self.allocator);
@@ -676,7 +726,7 @@ pub const Client = struct {
             }
             params.deinit();
         }
-        
+
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
         try params.put("name", .{ .string = name_copy });
@@ -733,8 +783,10 @@ pub const Client = struct {
             try params.put("progressToken", try protocol.cloneValue(self.allocator, token));
         }
 
-        // Send request
+        // Create a unique ID for this request
         const id = self.nextId();
+        
+        // Create request state with progress handling info
         const req_state = RequestState{
             .id = id,
             .allocator = self.allocator,
@@ -742,15 +794,17 @@ pub const Client = struct {
             .on_progress = self.callback_context.on_progress,
             .user_context = self.callback_context.user_context,
         };
-        
+
+        // Add to pending requests here, sendRequest will detect and avoid double-adding
         try self.pending_requests.append(req_state);
-        
+        std.debug.print("Added tool call request to pending_requests\n", .{});
+
         const params_value = protocol.Value{ .object = params };
         try self.sendRequest("tools/call", params_value, id);
-        
+
         // Wait for response with proper timeout handling
         const response = try self.waitForResponse(id, options.timeout_ms);
-        
+
         if (response.@"error" != null) {
             return error.ToolCallFailed;
         }
@@ -768,7 +822,7 @@ pub const Client = struct {
             self.allocator,
             content.array.items.len,
         );
-        
+
         for (content.array.items) |item| {
             try content_copy.append(try protocol.cloneValue(self.allocator, item));
         }
@@ -778,43 +832,103 @@ pub const Client = struct {
             .content = try content_copy.toOwnedSlice(),
         };
     }
-    
+
     /// Wait for a response with an optional timeout
     fn waitForResponse(self: *Client, id: protocol.Value, timeout_ms: ?u32) !protocol.Response {
+        std.debug.print("waitForResponse: Looking for ", .{});
+        debugPrintId("", id);
+        
         // Don't create a new request state as the calling function should have already created one
         var timer: ?std.time.Timer = null;
         if (timeout_ms != null) {
             timer = try std.time.Timer.start();
         }
         
-        var request_completed = false;
-        while (!request_completed) {
+        // Debug: show current queue and pending requests
+        std.debug.print("Current queue size: {d}\n", .{self.message_queue.items.len});
+        std.debug.print("Current pending requests: {d}\n", .{self.pending_requests.items.len});
+        
+        // First check if we already have this response in our queue
+        for (self.message_queue.items, 0..) |*resp, index| {
+            // Skip responses with null IDs (shouldn't happen per protocol but being defensive)
+            if (resp.id == null) continue;
+            
+            debugPrintId("Checking queued response", resp.id.?);
+            
+            const matches = compareIds(resp.id.?, id);
+            std.debug.print("Queue item {d} matches: {}\n", .{index, matches});
+            
+            if (matches) {
+                // Found it in the queue, remove and return it
+                std.debug.print("✅ Found response in queue for ", .{});
+                debugPrintId("", id);
+                
+                const response = try protocol.cloneResponse(self.allocator, resp.*);
+                _ = self.message_queue.orderedRemove(index);
+                return response;
+            }
+        }
+        
+        // Process any messages that are immediately available
+        try self.processAvailable();
+        
+        // Check if our specific request is now completed
+        for (self.pending_requests.items, 0..) |req, index| {
+            std.debug.print("After processing, checking pending request at index {}: ", .{index});
+            debugPrintId("", req.id);
+            
+            if (compareIds(req.id, id) and req.completed) {
+                std.debug.print("✅ waitForResponse: request ID is now completed\n", .{});
+                const response = req.response.?;
+                
+                // Make a copy of the response before removing the request state
+                const response_copy = try protocol.cloneResponse(self.allocator, response);
+                
+                // Remove from pending requests
+                _ = self.pending_requests.swapRemove(index);
+                
+                return response_copy;
+            }
+        }
+        
+        // Main waiting loop
+        var loops: u32 = 0;
+        while (true) {
+            loops += 1;
+            if (loops % 1000 == 0) {
+                std.debug.print("waitForResponse: still waiting after {} loops for ID {}\n", .{
+                    loops,
+                    if (id == .integer) id.integer else @as(i64, 0)
+                });
+            }
+            
             // Process any incoming messages
             try self.processOneMessage();
-
+            
             // Check if our request has completed
             for (self.pending_requests.items, 0..) |req, index| {
                 if (protocol.valuesEqual(req.id, id) and req.completed) {
+                    std.debug.print("waitForResponse: found completed request after {} loops\n", .{loops});
                     const response = req.response.?;
                     
                     // Make a copy of the response before removing the request state
                     const response_copy = try protocol.cloneResponse(self.allocator, response);
-
+                    
                     // Remove from pending requests
                     _ = self.pending_requests.swapRemove(index);
-
-                    request_completed = true;
+                    
                     return response_copy;
                 }
             }
-
+            
             // Check timeout
             if (timer) |*t| {
                 if (timeout_ms.? <= t.read() / std.time.ns_per_ms) {
+                    std.debug.print("waitForResponse: timeout exceeded\n", .{});
                     // Send cancellation
                     var cancel_params = std.json.ObjectMap.init(self.allocator);
                     errdefer cancel_params.deinit();
-                    
+
                     try cancel_params.put("id", id);
                     try cancel_params.put("reason", .{ .string = "Timeout exceeded" });
 
@@ -822,7 +936,7 @@ pub const Client = struct {
                     return error.Timeout;
                 }
             }
-
+            
             // Yield to avoid busy waiting
             std.time.sleep(1 * std.time.ns_per_ms);
         }
@@ -851,6 +965,35 @@ pub const Client = struct {
     pub fn processMessages(self: *Client) !void {
         while (try self.hasMessages()) {
             try self.processOneMessage();
+        }
+    }
+    
+    pub fn processAvailable(self: *Client) !void {
+        // Read and process any available messages without blocking
+        while (true) {
+            const message = try self.readMessage();
+            if (message.len == 0) break; // No more messages available
+            
+            defer self.allocator.free(message);
+            std.debug.print("Processing message: {s}\n", .{message});
+            
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                message,
+                .{},
+            );
+            defer parsed.deinit();
+            
+            const json = parsed.value;
+            
+            if (protocol.isResponse(json)) {
+                try self.handleResponse(json);
+            } else if (protocol.isNotification(json)) {
+                try self.handleNotification(json);
+            } else if (protocol.isRequest(json)) {
+                try self.handleRequest(json);
+            }
         }
     }
 
@@ -883,6 +1026,7 @@ pub const Client = struct {
         if (message.len == 0) return;
 
         // Debug log
+        std.debug.print("processOneMessage: Received message of length {}\n", .{message.len});
         if (self.debug_file) |file| {
             try file.writer().print("Received: {s}\n", .{message});
         }
@@ -900,13 +1044,17 @@ pub const Client = struct {
 
         // Check if this is a request, response, or notification
         if (protocol.isResponse(json)) {
+            std.debug.print("processOneMessage: Handling response\n", .{});
             try self.handleResponse(json);
         } else if (protocol.isNotification(json)) {
+            std.debug.print("processOneMessage: Handling notification\n", .{});
             try self.handleNotification(json);
         } else if (protocol.isRequest(json)) {
+            std.debug.print("processOneMessage: Handling request\n", .{});
             try self.handleRequest(json);
         } else {
             // Invalid message
+            std.debug.print("processOneMessage: Invalid message format\n", .{});
             if (self.debug_file) |file| {
                 try file.writer().print("Invalid message format: {s}\n", .{message});
             }
@@ -916,10 +1064,31 @@ pub const Client = struct {
     fn readMessage(self: *Client) ![]const u8 {
         switch (self.transport) {
             .Stdio => |stdio| {
+                // Poll for data
+                var poll_fds = [_]std.posix.pollfd{
+                    .{
+                        .fd = stdio.stdout.handle,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    },
+                };
+                
+                const available = try std.posix.poll(&poll_fds, 0); // 0 = non-blocking
+                const has_input = (available > 0) and ((poll_fds[0].revents & std.posix.POLL.IN) != 0);
+                
+                if (!has_input) {
+                    // No data available
+                    return &[_]u8{};
+                }
+                
+                // Data available, read it
                 var buf: [8192]u8 = undefined;
                 if (try stdio.stdout.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
+                    std.debug.print("readMessage: Read {} bytes\n", .{line.len});
                     return try self.allocator.dupe(u8, line);
                 } else {
+                    // EOF reached
+                    std.debug.print("readMessage: EOF reached\n", .{});
                     return &[_]u8{};
                 }
             },
@@ -933,22 +1102,36 @@ pub const Client = struct {
     fn handleResponse(self: *Client, json: protocol.Value) !void {
         // Extract ID
         const id = json.object.get("id") orelse return;
+        
+        std.debug.print("Response received with ", .{});
+        debugPrintId("response", id);
 
-        // Find matching request
+        // Parse response
+        const response = try protocol.parseResponse(self.allocator, json);
+        
+        // First check if this matches any pending request
+        var matched = false;
         for (self.pending_requests.items, 0..) |*req, index| {
-            _ = index; // autofix
-            if (protocol.valuesEqual(req.id, id)) {
+            std.debug.print("Comparing with pending request at index {}: ", .{index});
+            debugPrintId("request", req.id);
+            
+            if (compareIds(req.id, id)) {
                 req.completed = true;
-
-                // Parse response
-                const response = try protocol.parseResponse(self.allocator, json);
                 req.response = response;
-
-                return;
+                matched = true;
+                std.debug.print("✅ MATCHED! Response for request at index {}\n", .{index});
+                break;
+            } else {
+                std.debug.print("❌ NO MATCH for request at index {}\n", .{index});
             }
         }
-
-        // No matching request found, this could be a response to a cancelled request
+        
+        // If not matched, queue it for later processing
+        if (!matched) {
+            std.debug.print("⚠️ Queueing unmatched response for ", .{});
+            debugPrintId("", id);
+            try self.message_queue.append(response);
+        }
     }
 
     fn handleNotification(self: *Client, json: protocol.Value) !void {
@@ -1046,10 +1229,41 @@ pub const Client = struct {
     }
 
     fn waitForResponseSimple(self: *Client, id: protocol.Value) !protocol.Response {
+        std.debug.print("waitForResponseSimple: waiting for id {}\n", .{if (id == .integer) id.integer else @as(u32, 0)});
         return self.waitForResponse(id, null);
     }
 
     fn sendRequest(self: *Client, method: []const u8, params: ?protocol.Value, id: protocol.Value) !void {
+        std.debug.print("Sending request with method: {s}, ", .{method});
+        debugPrintId("request", id);
+        
+        // Display pending requests before adding
+        std.debug.print("Current pending requests: {d}\n", .{self.pending_requests.items.len});
+        
+        // Only add to pending requests if this is a method that expects a response
+        // and if we're not using an existing request state (like in callTool)
+        var found = false;
+        for (self.pending_requests.items) |*req| {
+            if (compareIds(req.id, id)) {
+                found = true;
+                std.debug.print("Request already in pending_requests list\n", .{});
+                break;
+            }
+        }
+        
+        if (!found) {
+            // Create request state with a cloned ID to ensure ownership
+            const req_state = RequestState{
+                .id = try protocol.cloneValue(self.allocator, id),
+                .allocator = self.allocator,
+            };
+            
+            // Add to pending requests
+            try self.pending_requests.append(req_state);
+            
+            std.debug.print("Added to pending requests, new count: {d}\n", .{self.pending_requests.items.len});
+        }
+        
         const request = protocol.Request{
             .jsonrpc = "2.0",
             .method = method,
@@ -1059,7 +1273,7 @@ pub const Client = struct {
 
         const message = try self.serializeMessage(request);
         defer self.allocator.free(message);
-        
+
         if (self.debug_file) |file| {
             try file.writer().print("Sending request: {s}\n", .{message});
         }
@@ -1085,7 +1299,7 @@ pub const Client = struct {
 
         const message = try self.serializeMessage(response);
         defer self.allocator.free(message);
-        
+
         if (self.debug_file) |file| {
             try file.writer().print("Sending response: {s}\n", .{message});
         }
@@ -1110,7 +1324,7 @@ pub const Client = struct {
 
         const message = try self.serializeMessage(notification);
         defer self.allocator.free(message);
-        
+
         if (self.debug_file) |file| {
             try file.writer().print("Sending notification: {s}\n", .{message});
         }

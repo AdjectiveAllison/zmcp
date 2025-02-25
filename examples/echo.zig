@@ -9,6 +9,9 @@ const EchoParams = struct {
 };
 
 fn echoFn(params: EchoParams) ![]const u8 {
+    std.debug.print("echoFn called with message: {s}, count: {}\n", 
+        .{params.message, params.count});
+        
     var result = std.ArrayList(u8).init(params.allocator);
     errdefer result.deinit();
 
@@ -59,6 +62,8 @@ pub fn main() !void {
 
     var server = try zmcp.Server.init(allocator, "Example Server", "1.0.0");
     defer server.deinit();
+
+    std.debug.print("Echo server initialized and starting...\n", .{});
 
     try server.addTool(echo_tool);
     try server.start();

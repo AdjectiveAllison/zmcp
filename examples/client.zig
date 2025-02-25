@@ -45,10 +45,25 @@ pub fn main() !void {
     };
 
     // Find server path for connection
+    std.debug.print("Starting client...\n", .{});
+    std.debug.print("Finding server executable...\n", .{});
+
     const server_path = try findServerPath(allocator);
     defer allocator.free(server_path);
 
+    std.debug.print("Using server at: {s}\n", .{server_path});
+
+    // Verify the executable exists and is readable
+    std.fs.cwd().access(server_path, .{}) catch {
+        std.debug.print("ERROR: Server executable not found at {s}\n", .{server_path});
+        std.debug.print("Make sure to run 'zig build build-echo' first\n", .{});
+        return error.ServerNotFound;
+    };
+
+    std.debug.print("Server executable verified!\n", .{});
+
     // Create client with builder pattern
+    std.debug.print("Creating client and connecting to server...\n", .{});
     var client = try zmcp.Client.builder(allocator)
         .withName("Example Client")
         .withVersion("1.0.0")
@@ -61,9 +76,18 @@ pub fn main() !void {
         .build();
     defer client.deinit();
 
+    std.debug.print("Client connected to server successfully!\n", .{});
+
     // List available tools
-    std.debug.print("Available tools:\n", .{});
-    const tools = try client.listTools();
+    std.debug.print("\nListing available tools...\n", .{});
+
+    const tools = client.listTools() catch |err| {
+        std.debug.print("Error listing tools: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    std.debug.print("Found {d} tools.\n", .{tools.len});
+
     defer {
         for (tools) |*tool| {
             // Clean up each tool
@@ -95,8 +119,10 @@ pub fn main() !void {
     const progress_token = zmcp.protocol.Value{ .string = try allocator.dupe(u8, "progress-token") };
     defer if (progress_token == .string) allocator.free(progress_token.string);
 
-    // Using the simplified callToolText API
-    const text_result = try client.callToolText(
+    // Using the simplified callToolText API with shorter timeout
+    std.debug.print("Sending tool call with text return (5s timeout)...\n", .{});
+
+    const text_result = client.callToolText(
         selected_tool,
         .{
             .message = "Hello from client!",
@@ -104,15 +130,21 @@ pub fn main() !void {
         },
         .{
             .progress_token = progress_token,
-            .timeout_ms = 10000,
+            .timeout_ms = 5000, // Use a shorter timeout to fail faster if there's an issue
         },
-    );
+    ) catch |err| {
+        std.debug.print("Error calling tool: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer allocator.free(text_result);
 
-    std.debug.print("\n\nTool call result: {s}\n", .{text_result});
+    std.debug.print("\nTool call succeeded!\n", .{});
+    std.debug.print("Result: {s}\n", .{text_result});
 
     // Also demonstrate the regular callTool API
-    var call_result = try client.callTool(
+    std.debug.print("\nCalling tool with full result object...\n", .{});
+
+    var call_result = client.callTool(
         selected_tool,
         .{
             .message = "Another message",
@@ -121,11 +153,14 @@ pub fn main() !void {
         .{
             .timeout_ms = 5000,
         },
-    );
+    ) catch |err| {
+        std.debug.print("Error calling tool: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer call_result.deinit(allocator);
 
     // Print the result
-    std.debug.print("\nRegular tool call result:\n", .{});
+    std.debug.print("\nRegular tool call succeeded!\n", .{});
     std.debug.print("Is error: {}\n", .{call_result.is_error});
 
     for (call_result.content) |content| {
@@ -142,12 +177,55 @@ pub fn main() !void {
     }
 
     // Set log level to debug
-    try client.setLogLevel("debug");
-    std.debug.print("\nSet log level to debug\n", .{});
+    std.debug.print("\nSetting log level to debug...\n", .{});
+
+    client.setLogLevel("debug") catch |err| {
+        std.debug.print("Error setting log level: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    std.debug.print("Log level set successfully.\n", .{});
+    std.debug.print("\nClient test completed successfully!\n", .{});
 }
 
 fn findServerPath(allocator: std.mem.Allocator) ![]const u8 {
-    // For simplicity in this example, we'll assume the server is in the same directory
-    // as the client and named "echo-example"
-    return allocator.dupe(u8, "./zig-out/bin/echo-example");
+    // First check the standard zig-out/bin location
+    const standard_path = "./zig-out/bin/echo-example";
+
+    // Test if file exists
+    if (std.fs.cwd().access(standard_path, .{})) {
+        return allocator.dupe(u8, standard_path);
+    } else |_| {
+        // Print detailed debugging info to help find the executable
+        std.debug.print("Could not find server at standard path: {s}\n", .{standard_path});
+
+        // Get current working directory
+        var cwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        const cwd = try std.posix.getcwd(&cwd_buf); // Fixed: std.os.getcwd -> std.posix.getcwd
+        std.debug.print("Current working directory: {s}\n", .{cwd});
+
+        // Try to check zig-out/bin directory
+        var bin_dir = std.fs.cwd().openDir("zig-out/bin", .{ .iterate = true }) catch |err| {
+            std.debug.print("Could not open zig-out/bin directory: {s}\n", .{@errorName(err)});
+            return allocator.dupe(u8, standard_path); // Return standard path even though we know it doesn't exist
+        };
+        defer bin_dir.close();
+
+        // List all files in bin directory
+        var it = bin_dir.iterate();
+        std.debug.print("Contents of zig-out/bin directory:\n", .{});
+        while (try it.next()) |entry| {
+            std.debug.print("  {s} ({s})\n", .{ entry.name, @tagName(entry.kind) });
+
+            // If we find the echo-example, use it
+            if (std.mem.eql(u8, entry.name, "echo-example")) {
+                const full_path = try std.fs.path.join(allocator, &[_][]const u8{ "zig-out/bin", entry.name });
+                return full_path;
+            }
+        }
+
+        // If we got here, we couldn't find the echo example in the expected location
+        std.debug.print("WARNING: Could not find echo-example in expected locations.\n", .{});
+        return allocator.dupe(u8, standard_path);
+    }
 }

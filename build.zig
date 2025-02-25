@@ -43,7 +43,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     echo_example.root_module.addImport("zmcp", zmcp_module);
-    b.installArtifact(echo_example);
+
+    // Install the echo example
+    const echo_install = b.addInstallArtifact(echo_example, .{});
+
+    // Add a build-only step for the echo example
+    const build_echo_step = b.step("build-echo", "Build the echo example without running");
+    build_echo_step.dependOn(&echo_install.step);
 
     // Add a run step for the echo example
     const run_echo_cmd = b.addRunArtifact(echo_example);
@@ -61,7 +67,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_example.root_module.addImport("zmcp", zmcp_module);
-    b.installArtifact(client_example);
+
+    // Install the client example
+    const client_install = b.addInstallArtifact(client_example, .{});
+
+    // Add a build-only step for the client example
+    const build_client_step = b.step("build-client", "Build the client example without running");
+    build_client_step.dependOn(&client_install.step);
 
     // Add a run step for the client example
     const run_client_cmd = b.addRunArtifact(client_example);
@@ -70,6 +82,35 @@ pub fn build(b: *std.Build) void {
     }
     const run_client_step = b.step("run-client", "Run the client example");
     run_client_step.dependOn(&run_client_cmd.step);
+
+    // Build the test client (simple version)
+    const test_client = b.addExecutable(.{
+        .name = "test-client",
+        .root_source_file = b.path("examples/test_client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Install the test client
+    const test_client_install = b.addInstallArtifact(test_client, .{});
+
+    // Add a build-only step for the test client
+    const build_test_client_step = b.step("build-test-client", "Build the simple test client");
+    build_test_client_step.dependOn(&test_client_install.step);
+
+    // Add a run step for the test client
+    const run_test_client_cmd = b.addRunArtifact(test_client);
+    if (b.args) |args| {
+        run_test_client_cmd.addArgs(args);
+    }
+    const run_test_client_step = b.step("run-test-client", "Run the simple test client");
+    run_test_client_step.dependOn(&run_test_client_cmd.step);
+
+    // Add a build-all-examples step
+    const build_examples_step = b.step("build-examples", "Build all examples without running");
+    build_examples_step.dependOn(build_echo_step);
+    build_examples_step.dependOn(build_client_step);
+    build_examples_step.dependOn(build_test_client_step);
 
     // Unit tests
     const lib_unit_tests = b.addTest(.{

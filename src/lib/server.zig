@@ -147,24 +147,53 @@ pub const Server = struct {
     pub fn start(self: *Server) !void {
         const stdin = std.io.getStdIn();
         const stdout = std.io.getStdOut();
-        const debug_file = try std.fs.cwd().createFile("debug.log", .{});
+        const debug_file = try std.fs.cwd().createFile("server_debug.log", .{});
         defer debug_file.close();
+
+        std.debug.print("Server starting...\n", .{});
+        try debug_file.writer().print("Server starting\n", .{});
 
         var is_initialized = false;
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         var arena = arena_state.allocator();
 
+        // Add this polling check to not block forever
+        var counter: u32 = 0;
         while (true) {
             arena_state = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_state.deinit();
             arena = arena_state.allocator();
 
+            // Read a line with non-blocking check
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = stdin.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+
+            counter += 1;
+            if (counter % 1000 == 0) {
+                try debug_file.writer().print("Still waiting for input (iteration {})\n", .{counter});
+                std.debug.print("Server: Still waiting for input (iteration {})\n", .{counter});
+            }
+
+            const available = try std.posix.poll(&poll_fds, 1); // 1ms timeout
+            const has_input = (available > 0) and ((poll_fds[0].revents & std.posix.POLL.IN) != 0);
+            if (!has_input) {
+                // No data available, continue polling
+                std.time.sleep(1 * std.time.ns_per_ms);
+                continue;
+            }
+
             // Read a line
-            var buf: [4096]u8 = undefined;
+            var buf: [8192]u8 = undefined;
             if (try stdin.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
                 // Debug: log received message
                 try debug_file.writer().print("Received: {s}\n", .{line});
+                std.debug.print("Server received: {s}\n", .{line});
 
                 // Parse JSON message
                 const parsed = try std.json.parseFromSlice(
